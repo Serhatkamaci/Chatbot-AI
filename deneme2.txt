@@ -1,0 +1,669 @@
+import os
+import sys
+import subprocess
+import time
+from pathlib import Path
+from typing import List, Dict, Any
+import argparse
+import platform
+import PyPDF2
+import docx
+from sentence_transformers import SentenceTransformer
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+import requests
+import json
+import re
+import warnings
+import pickle
+import base64
+from dotenv import load_dotenv
+import streamlit as st
+from concurrent.futures import ThreadPoolExecutor
+
+warnings.filterwarnings("ignore")
+load_dotenv()
+
+# ==================== Kalıcılık Fonksiyonları ====================
+SAVE_FILE = "cubes_state.pkl"
+
+
+def save_cubes_state(cubes_dict):
+    serializable_data = {
+        name: cube.to_dict()
+        for name, cube in cubes_dict.items()
+    }
+    try:
+        with open(SAVE_FILE, "wb") as f:
+            pickle.dump(serializable_data, f)
+    except Exception as e:
+        st.error(f"❌ Küp verileri kaydedilirken hata oluştu: {e}")
+
+
+def load_cubes_state(api_key: str, embedding_model: str, llm_model: str):
+    if os.path.exists(SAVE_FILE):
+        try:
+            with open(SAVE_FILE, "rb") as f:
+                serializable_data = pickle.load(f)
+            cubes = {}
+            for name, data in serializable_data.items():
+                cube = DocumentQASystem(api_key, embedding_model, llm_model)
+                cube.from_dict(data)
+                cubes[name] = cube
+            return cubes
+        except Exception as e:
+            st.error(f"❌ Küpler yüklenirken hata oluştu: {e}")
+            return {}
+    return {}
+
+
+# ==================== Belge Okuyucu ====================
+class DocumentProcessor:
+    def __init__(self):
+        self.supported_formats = ['.txt', '.pdf', '.docx']
+
+    def read_txt(self, file_path: str) -> str:
+        try:
+            with open(file_path, 'r', encoding='utf-8') as file:
+                return file.read()
+        except UnicodeDecodeError:
+            encodings = ['latin-1', 'cp1254', 'iso-8859-9']
+            for encoding in encodings:
+                try:
+                    with open(file_path, 'r', encoding=encoding) as file:
+                        return file.read()
+                except UnicodeDecodeError:
+                    continue
+            raise Exception(f"Dosya okunamadı: {file_path}")
+
+    def read_pdf(self, file_path: str) -> str:
+        text = ""
+        try:
+            with open(file_path, 'rb') as file:
+                pdf_reader = PyPDF2.PdfReader(file)
+                for page in pdf_reader.pages:
+                    text += page.extract_text() + "\n\f"
+        except Exception as e:
+            raise Exception(f"PDF okunamadı: {e}")
+        return text
+
+    def read_docx(self, file_path: str) -> str:
+        try:
+            doc = docx.Document(file_path)
+            return "\n".join([p.text for p in doc.paragraphs])
+        except Exception as e:
+            raise Exception(f"DOCX okunamadı: {e}")
+
+    def read_document(self, file_path: str) -> str:
+        file_path = Path(file_path)
+        if not file_path.exists(): raise FileNotFoundError(f"Dosya bulunamadı: {file_path}")
+        extension = file_path.suffix.lower()
+        if extension == '.txt':
+            return self.read_txt(str(file_path))
+        elif extension == '.pdf':
+            return self.read_pdf(str(file_path))
+        elif extension == '.docx':
+            return self.read_docx(str(file_path))
+        else:
+            raise ValueError(f"Desteklenmeyen format: {extension}")
+
+
+# ==================== Chunker ====================
+class TextChunker:
+    def __init__(self, chunk_size: int = 800, overlap: int = 100):
+        self.chunk_size = chunk_size
+        self.overlap = overlap
+
+    def chunk_text(self, text: str) -> List[str]:
+        paragraphs = text.split('\n\n')
+        chunks = []
+        current_chunk = ""
+        for paragraph in paragraphs:
+            if len(paragraph) > self.chunk_size:
+                sentences = re.split(r'[.!?]+', paragraph)
+                for sentence in sentences:
+                    if len(current_chunk) + len(sentence) > self.chunk_size:
+                        if current_chunk.strip(): chunks.append(current_chunk.strip())
+                        current_chunk = sentence
+                    else:
+                        current_chunk += " " + sentence
+            else:
+                if len(current_chunk) + len(paragraph) > self.chunk_size:
+                    if current_chunk.strip(): chunks.append(current_chunk.strip())
+                    current_chunk = paragraph
+                else:
+                    current_chunk += "\n\n" + paragraph
+        if current_chunk.strip(): chunks.append(current_chunk.strip())
+        return [chunk for chunk in chunks if len(chunk.strip()) > 50]
+
+
+# ==================== Vektör Store ====================
+class VectorStore:
+    def __init__(self, model_name: str = "intfloat/multilingual-e5-large"):
+        if "model" not in st.session_state:
+            st.session_state.model_loading_status = "Embedding modeli yükleniyor..."
+            try:
+                st.session_state.model = SentenceTransformer(model_name)
+                st.session_state.model_loading_status = "Model başarıyla yüklendi!"
+            except Exception as e:
+                st.session_state.model_loading_status = f"Model yüklenirken hata oluştu: {e}"
+                st.error(f"Model yüklenirken hata oluştu: {e}")
+        self.chunks = []
+        self.embeddings = None
+        self.chunk_documents = []
+
+    def add_documents(self, chunks: List[str], document_names: List[str], status_dict: Dict = None):
+        if len(chunks) != len(document_names): raise ValueError(
+            "Chunks ve document_names listeleri aynı uzunlukta olmalı")
+        if not chunks: return
+
+        batch_size = 24
+        all_new_embeddings = []
+
+        for i in range(0, len(chunks), batch_size):
+            batch_chunks = chunks[i:i + batch_size]
+            batch_embeddings = st.session_state.model.encode(batch_chunks, show_progress_bar=False)
+            all_new_embeddings.append(batch_embeddings)
+            if status_dict:
+                status_dict['processed_chunks'] = min(status_dict.get('processed_chunks', 0) + len(batch_chunks),
+                                                      status_dict.get('total_chunks', len(chunks)))
+
+        new_embeddings = np.vstack(all_new_embeddings)
+
+        if self.embeddings is None or len(self.embeddings) == 0:
+            self.embeddings = new_embeddings
+        else:
+            self.embeddings = np.vstack([self.embeddings, new_embeddings])
+
+        self.chunks.extend(chunks)
+        self.chunk_documents.extend(document_names)
+        if status_dict: status_dict['processed_chunks'] = status_dict['total_chunks']
+
+    def remove_document(self, document_name: str):
+        if not self.chunks: return
+        indices_to_keep = [i for i, doc in enumerate(self.chunk_documents) if doc != document_name]
+        if len(indices_to_keep) == len(self.chunks): return
+        self.chunks = [self.chunks[i] for i in indices_to_keep]
+        self.chunk_documents = [self.chunk_documents[i] for i in indices_to_keep]
+        if self.embeddings is not None and len(indices_to_keep) > 0:
+            self.embeddings = self.embeddings[indices_to_keep]
+        else:
+            self.embeddings = None
+        st.success(f"'{document_name}' belgesi başarıyla silindi!")
+
+    def search(self, query: str, top_k: int = 5) -> List[tuple]:
+        if self.embeddings is None or len(self.embeddings) == 0: return []
+        query_embedding = st.session_state.model.encode([f"query: {query}"])
+        similarities = cosine_similarity(query_embedding, self.embeddings)[0]
+        top_indices = np.argsort(similarities)[::-1][:top_k]
+        return [(self.chunks[i], similarities[i]) for i in top_indices]
+
+    def get_state(self) -> Dict[str, Any]:
+        return {"chunks": self.chunks, "embeddings": self.embeddings.tolist() if self.embeddings is not None else None,
+                "chunk_documents": self.chunk_documents}
+
+    def load_state(self, state: Dict[str, Any]):
+        self.chunks = state.get("chunks", [])
+        self.chunk_documents = state.get("chunk_documents", [])
+        embeddings_data = state.get("embeddings", None)
+        self.embeddings = np.array(embeddings_data) if embeddings_data is not None else None
+
+
+# ==================== Page Index Store & Custom API Client & QA System ====================
+class PageIndexStore:
+    def __init__(self):
+        self.pages = []
+
+    def add_document_pages(self, text: str, document_name: str):
+        pages = text.split("\f")
+        if len(pages) == 1: pages = text.split("\n\n\n")
+        if len(pages) == 1: pages = [text]
+        new_pages = [(document_name, i + 1, p.strip()) for i, p in enumerate(pages) if p.strip()]
+        self.pages.extend(new_pages)
+
+    def remove_document(self, document_name: str):
+        self.pages = [page for page in self.pages if page[0] == document_name]
+
+    def search(self, query: str, top_k: int = 3) -> List[tuple]:
+        results = []
+        query_words = set(re.findall(r'\b\w+\b', query.lower()))
+        for doc_name, page_no, content, in self.pages:
+            content_words = set(re.findall(r'\b\w+\b', content.lower()))
+            score = len(query_words.intersection(content_words))
+            if score > 0: results.append((doc_name, page_no, content, score))
+        return sorted(results, key=lambda x: x[3], reverse=True)[:top_k]
+
+    def get_state(self) -> List[tuple]:
+        return self.pages
+
+    def load_state(self, state: List[tuple]):
+        self.pages = state
+
+
+class CustomAPIClient:
+    def __init__(self, api_key: str, model_name: str = "gpt-4.1"):
+        if not api_key:
+            raise ValueError("Özel API anahtarı sağlanmalıdır.")
+        self.url = "https://aigateway.xxx.com.tr/chat/v1/chat/completions"
+        self.api_key = api_key
+        self.model_name = model_name
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
+
+    def generate(self, prompt: str, context: str = "") -> str:
+        full_prompt = f"Aşağıdaki bağlam bilgilerini kullanarak soruya detaylı ve net bir şekilde cevap verin. Eğer bağlam bilgileri yeterli değilse cevap verme ve Bu Bilgi Belgede Bulunmamaktadır yaz. Yanıtı Türkçe olarak oluşturun. Bağlamdaki sayfa numaralarını ve başlık numaralarıyla birlikte başlıklarını da paylaş.\n\nBağlam bilgileri:\n{context}\n\nSoru: {prompt}"
+
+        data = {
+            "model": self.model_name,
+            "messages": [{"role": "user", "content": full_prompt}],
+            "stream": False
+        }
+
+        try:
+            response = requests.post(self.url, headers=self.headers, data=json.dumps(data), timeout=90)
+
+            if response.status_code == 200:
+                response_json = response.json()
+                # Standart OpenAI uyumlu API'ler genellikle bu formatta yanıt verir
+                # Eğer yanıt formatı farklıysa, bu satırı düzenlemeniz gerekebilir
+                return response_json.get("content", "No content found")
+            else:
+                return f"❌ API Hatası: Durum Kodu {response.status_code}, Mesaj: {response.text}"
+
+        except requests.exceptions.RequestException as e:
+            return f"❌ Ağ Hatası: API'ye bağlanılamadı. Hata: {e}"
+        except (KeyError, IndexError) as e:
+            return f"❌ API Yanıt Hatası: Yanıt formatı beklenmedik. Hata: {e}, Gelen Yanıt: {response.text}"
+
+
+class DocumentQASystem:
+    def __init__(self, api_key: str, embedding_model: str, llm_model: str):
+        self.doc_processor = DocumentProcessor()
+        self.chunker = TextChunker()
+        self.vector_store = VectorStore(embedding_model)
+        self.page_index = PageIndexStore()
+        self.custom_api_client = CustomAPIClient(api_key, llm_model)
+        self.loaded_documents = []
+
+    def load_document(self, file_path: str, file_name: str):
+        text = self.doc_processor.read_document(file_path)
+        self.page_index.add_document_pages(text, file_name)
+        return self.chunker.chunk_text(text)
+
+    def remove_document(self, document_name: str):
+        if document_name not in self.loaded_documents: return
+        self.vector_store.remove_document(document_name)
+        self.page_index.remove_document(document_name)
+        self.loaded_documents.remove(document_name)
+        st.success(f"'{document_name}' belgesi tamamen silindi!")
+
+    def answer_question(self, question: str) -> str:
+        if not self.loaded_documents: return "⚠️ Henüz hiç belge yüklenmedi."
+        context_parts = []
+        page_hits = self.page_index.search(question, top_k=2)
+        if page_hits:
+            for doc_name, page_no, content, _ in page_hits: context_parts.append(
+                f"[Dosya: {doc_name}, Sayfa: {page_no}]\n{content[:800]}...")
+        relevant_chunks = self.vector_store.search(question, top_k=3)
+        if relevant_chunks:
+            for i, (chunk, _) in enumerate(relevant_chunks, 1): context_parts.append(f"[Chunk {i}]\n{chunk}")
+        if not context_parts: return "🔍 İlgili bilgi bulunamadı."
+        context = "\n\n".join(context_parts[:4])
+        print(" -----QUESTION-----" + question, "-----CONTEXT------," + context)
+        return self.custom_api_client.generate(question, context)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"loaded_documents": self.loaded_documents, "vector_store_data": self.vector_store.get_state(),
+                "page_index_data": self.page_index.get_state()}
+
+    def from_dict(self, data: Dict[str, Any]):
+        self.loaded_documents = data.get("loaded_documents", [])
+        self.vector_store.load_state(data.get("vector_store_data", {}))
+        self.page_index.load_state(data.get("page_index_data", []))
+
+
+# ==================== Arka Plan Yükleme Fonksiyonu ====================
+def process_uploads_background(cube_data: dict, uploaded_files: List[Any], api_key: str, embedding_model: str,
+                               llm_model: str, status_dict: Dict):
+    qa_system = DocumentQASystem(api_key, embedding_model, llm_model)
+    qa_system.from_dict(cube_data)
+    new_files = [f for f in uploaded_files if f.name not in qa_system.loaded_documents]
+    if not new_files:
+        return {"success": True, "message": "Tüm belgeler zaten yüklü.", "new_cube_data": qa_system.to_dict()}
+
+    all_chunks, chunk_document_names, temp_files_to_remove = [], [], []
+    try:
+        temp_dir = Path("./temp_uploads")
+        temp_dir.mkdir(exist_ok=True)
+        for uploaded_file in new_files:
+            file_path = temp_dir / f"{os.urandom(8).hex()}_{uploaded_file.name}"
+            temp_files_to_remove.append(file_path)
+            with open(file_path, "wb") as f: f.write(uploaded_file.getbuffer())
+            chunks = qa_system.load_document(str(file_path), uploaded_file.name)
+            all_chunks.extend(chunks)
+            chunk_document_names.extend([uploaded_file.name] * len(chunks))
+    except Exception as e:
+        return {"success": False, "message": f"Dosya işleme hatası: {e}", "new_cube_data": cube_data}
+    finally:
+        for file_path in temp_files_to_remove:
+            if os.path.exists(file_path): os.remove(file_path)
+
+    if all_chunks:
+        status_dict['total_chunks'] = len(all_chunks)
+        status_dict['processed_chunks'] = 0
+        qa_system.vector_store.add_documents(all_chunks, chunk_document_names, status_dict)
+        qa_system.loaded_documents.extend([f.name for f in new_files])
+
+    return {"success": True, "message": f"✅ {len(new_files)} yeni belge başarıyla eklendi!",
+            "new_cube_data": qa_system.to_dict()}
+
+
+def hide_streamlit_toolbar():
+    hide_streamlit_style = """
+        <style>
+        [data-testid="stMainMenu"], [data-testid="stDecoration"] {
+            visibility: hidden;
+            display: none;
+        }
+        [data-testid="stFooter"] {
+            visibility: hidden;
+            display: none;
+        }
+        [data-testid="stSidebarToggleButton"] {
+            visibility: visible !important;
+            display: flex !important;
+        }
+        .st-emotion-cache-1c7y2re {
+            display: flex;
+        }
+        </style>
+    """
+    st.markdown(hide_streamlit_style, unsafe_allow_html=True)
+
+
+def apply_custom_css():
+    st.markdown("""
+        <style>
+            .main .block-container { padding-top: 2rem; }
+            .stChatMessage { background-color: #f0f2f6; border-radius: 10px; padding: 10px 15px; }
+            [data-testid="stTabs"] { position: -webkit-sticky; position: sticky; top: 0; z-index: 999; background-color: #ffffff; }
+            [data-testid="stChatInput"] { position: fixed; bottom: 0; left: 50%; transform: translateX(-50%); width: 50%; background-color: white; z-index: 1000; padding-bottom: 1rem; }
+            .chat-container { padding-bottom: 5rem; }
+            .chat-logo { position: fixed; bottom: 100px; right: 100px; z-index: 1001; opacity: 0.1; }
+        </style>
+    """, unsafe_allow_html=True)
+
+
+# ==================== Streamlit Uygulaması ====================
+def main():
+    st.set_page_config(page_title="Bilgi Küpü Soru-Cevap Sistemi", page_icon="🤖", layout="wide")
+
+    hide_streamlit_toolbar()
+    apply_custom_css()
+
+    st.title("🤖 Bilgi Küpü Soru-Cevap Sistemi")
+    st.write("Farklı konulardaki belgelerinizi ayrı küplerde yönetin.")
+
+    api_key = os.getenv("xxx_API_KEY")
+    if not api_key:
+        st.error("❌ 'xxx_API_KEY' ortam değişkeni ayarlanmamış. Lütfen `.env` dosyasını kontrol edin.")
+        return
+
+    embedding_model = "intfloat/multilingual-e5-large"
+    llm_model = "gpt-4.1"  # Veya .env'den okuyabilirsiniz
+
+    if "uploader_key" not in st.session_state: st.session_state.uploader_key = 0
+    if "model" not in st.session_state: VectorStore()
+    if "cubes" not in st.session_state: st.session_state.cubes = load_cubes_state(api_key, embedding_model,
+                                                                                  llm_model)
+    if "selected_cube" not in st.session_state: st.session_state.selected_cube = None
+    if "upload_futures" not in st.session_state: st.session_state.upload_futures = {}
+    if "upload_status" not in st.session_state: st.session_state.upload_status = {}
+    if "is_uploading" not in st.session_state: st.session_state.is_uploading = False
+    if "uploading_cube_name" not in st.session_state: st.session_state.uploading_cube_name = None
+    if "sidebar_status_message" not in st.session_state: st.session_state.sidebar_status_message = None
+
+    is_any_upload_in_progress = st.session_state.is_uploading
+
+    if is_any_upload_in_progress and st.session_state.upload_futures:
+        finished_futures = []
+        for cube_name, future in list(st.session_state.upload_futures.items()):
+            if future.done():
+                try:
+                    result = future.result()
+                    if result and result.get("success"):
+                        updated_cube = DocumentQASystem(api_key, embedding_model, llm_model)
+                        updated_cube.from_dict(result.get("new_cube_data"))
+                        st.session_state.cubes[cube_name] = updated_cube
+                        st.session_state.uploader_key += 1
+                        st.toast(result.get("message"))
+                    else:
+                        st.error(f"Yükleme sırasında hata: {result.get('message', 'Bilinmeyen hata')}")
+                        st.toast(f"Yükleme hatası: {result.get('message', 'Bilinmeyen hata')}")
+                except Exception as e:
+                    st.error(f"Yükleme sonucu alınırken hata: {e}")
+                    st.toast(f"Yükleme hatası: {e}")
+
+                finished_futures.append(cube_name)
+
+        for cube_name in finished_futures:
+            del st.session_state.upload_futures[cube_name]
+
+        if not st.session_state.upload_futures:
+            st.session_state.is_uploading = False
+            st.session_state.uploading_cube_name = None
+            st.session_state.upload_status = {}
+            st.session_state.sidebar_status_message = None
+            save_cubes_state(st.session_state.cubes)
+            st.rerun()
+
+    with st.sidebar:
+        if os.path.exists("assets/logo.png"):
+            st.image("assets/logo.png")
+
+        st.header("📦 Küp Yönetimi")
+
+        if st.session_state.sidebar_status_message:
+            st.info(st.session_state.sidebar_status_message)
+
+        new_cube_name = st.text_input("Yeni küp adı girin:", key="new_cube_name_input")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("➕ Küp Oluştur"):
+                if new_cube_name and new_cube_name not in st.session_state.cubes:
+                    st.session_state.cubes[new_cube_name] = DocumentQASystem(api_key, embedding_model, llm_model)
+                    st.session_state.selected_cube = new_cube_name
+                    st.success(f"✅ '{new_cube_name}' küpü oluşturuldu!")
+                    st.session_state[f"messages_{new_cube_name}"] = []
+                    save_cubes_state(st.session_state.cubes)
+                    st.rerun()
+                elif new_cube_name:
+                    st.warning("⚠️ Bu isimde bir küp zaten mevcut.")
+                else:
+                    st.warning("⚠️ Lütfen bir küp adı girin.")
+
+        cube_names = list(st.session_state.cubes.keys())
+        try:
+            default_index = cube_names.index(
+                st.session_state.selected_cube) + 1 if st.session_state.selected_cube else 0
+        except ValueError:
+            default_index = 0
+
+        st.session_state.selected_cube = st.selectbox(
+            "Mevcut bir küp seçin:",
+            ["- Lütfen bir küp seçin -"] + cube_names,
+            index=default_index,
+            key="cube_dropdown",
+        )
+        if st.session_state.selected_cube == "- Lütfen bir küp seçin -":
+            st.session_state.selected_cube = None
+
+        if st.session_state.selected_cube:
+            st.write("---")
+            st.subheader("Kübü Güncelle/Sil")
+
+            new_cube_name_for_update = st.text_input("Yeni küp adını girin:", value=st.session_state.selected_cube,
+                                                     key="update_cube_name_input")
+            if st.button("✅ Küp Adını Güncelle", disabled=is_any_upload_in_progress):
+                old_name = st.session_state.selected_cube
+                new_name = new_cube_name_for_update
+                if new_name and new_name != old_name:
+                    if new_name in st.session_state.cubes:
+                        st.warning(f"⚠️ '{new_name}' isminde bir küp zaten mevcut.")
+                    else:
+                        st.session_state.cubes[new_name] = st.session_state.cubes.pop(old_name)
+                        if f"messages_{old_name}" in st.session_state:
+                            st.session_state[f"messages_{new_name}"] = st.session_state.pop(f"messages_{old_name}")
+                        st.session_state.selected_cube = new_name
+                        save_cubes_state(st.session_state.cubes)
+                        st.success(f"✅ Küp adı '{old_name}' olarak başarıyla '{new_name}' olarak güncellendi!")
+                        st.rerun()
+                else:
+                    st.warning("⚠️ Lütfen geçerli ve mevcut küpten farklı bir ad girin.")
+
+            if st.button("🗑️ Küpü Sil", disabled=(st.session_state.selected_cube is None or is_any_upload_in_progress)):
+                st.session_state.delete_mode = True
+
+            if st.session_state.get("delete_mode", False):
+                cube_to_delete = st.session_state.selected_cube
+                st.warning(f"⚠️ '{cube_to_delete}' küpünü silmek istediğinizden emin misiniz?")
+                col_yes, col_no = st.columns(2)
+                with col_yes:
+                    if st.button("✅ Evet, Sil", key="confirm_delete"):
+                        del st.session_state.cubes[cube_to_delete]
+                        if f"messages_{cube_to_delete}" in st.session_state: del st.session_state[
+                            f"messages_{cube_to_delete}"]
+                        st.session_state.selected_cube = None
+                        st.session_state.delete_mode = False
+                        save_cubes_state(st.session_state.cubes)
+                        st.success(f"✅ '{cube_to_delete}' küpü başarıyla silindi!")
+                        st.rerun()
+                with col_no:
+                    if st.button("❌ Hayır, İptal", key="cancel_delete"):
+                        st.session_state.delete_mode = False
+                        st.rerun()
+        st.write("---")
+
+    if st.session_state.selected_cube:
+        current_cube_name = st.session_state.selected_cube
+        st.header(f"Küp: {current_cube_name}")
+
+        tab1, tab2 = st.tabs(["💬 Sohbet", "📚 Belgeler"])
+
+        with tab2:
+            st.subheader(f"'{current_cube_name}' Küp Belgeleri")
+            uploaded_files = st.file_uploader("Yeni belgeler yükleyin", type=["pdf", "docx", "txt"],
+                                              accept_multiple_files=True,
+                                              key=f"uploader_{st.session_state.uploader_key}",
+                                              disabled=is_any_upload_in_progress)
+
+            if st.button("📄 Yeni Belgeleri Ekle", key=f"process_{current_cube_name}",
+                         disabled=is_any_upload_in_progress):
+                if uploaded_files:
+                    qa_system = st.session_state.cubes[current_cube_name]
+                    new_files_to_process = [f for f in uploaded_files if f.name not in qa_system.loaded_documents]
+                    if not new_files_to_process:
+                        st.warning("⚠️ Seçilen tüm dosyalar zaten bu küpte mevcut.")
+                    else:
+                        st.session_state.is_uploading = True
+                        st.session_state.uploading_cube_name = current_cube_name
+                        st.session_state.sidebar_status_message = f"⏳ '{current_cube_name}' küpüne dosya ekleniyor..."
+                        executor = ThreadPoolExecutor(max_workers=1)
+                        cube_data = qa_system.to_dict()
+                        status_dict = {'total_chunks': 0, 'processed_chunks': 0}
+                        st.session_state.upload_status = status_dict
+                        future = executor.submit(process_uploads_background, cube_data, new_files_to_process, api_key,
+                                                 embedding_model, llm_model, status_dict)
+                        st.session_state.upload_futures[current_cube_name] = future
+                        st.rerun()
+                else:
+                    st.warning("⚠️ Lütfen önce belge yükleyin.")
+
+            if st.session_state.is_uploading and current_cube_name == st.session_state.uploading_cube_name:
+                future = st.session_state.upload_futures.get(current_cube_name)
+                if future and not future.done():
+                    progress_placeholder = st.empty()
+                    status = st.session_state.get('upload_status', {})
+                    total = status.get('total_chunks', 0)
+                    processed = status.get('processed_chunks', 0)
+                    progress_percent = min(1.0, processed / total) if total > 0 else 0
+                    text_message = f"Vektörleştiriliyor: {processed}/{total} parça"
+                    if total == 0: text_message = "Dosyalar okunuyor ve hazırlanıyor..."
+                    progress_placeholder.progress(progress_percent, text=text_message)
+                    time.sleep(1)
+                    st.rerun()
+
+            st.write("---")
+            st.subheader("📋 Yüklü Belgeler")
+            qa_system = st.session_state.cubes[current_cube_name]
+            if qa_system.loaded_documents:
+                for i, doc_name in enumerate(sorted(qa_system.loaded_documents)):
+                    col1, col2 = st.columns([4, 1])
+                    with col1:
+                        st.write(f"📄 {doc_name}")
+                    with col2:
+                        if st.button("🗑️", key=f"delete_doc_{i}_{doc_name}", help=f"'{doc_name}' belgesini sil",
+                                     disabled=is_any_upload_in_progress):
+                            qa_system.remove_document(doc_name)
+                            save_cubes_state(st.session_state.cubes)
+                            st.rerun()
+            else:
+                st.info("Bu küpe henüz belge yüklenmedi.")
+
+        # ========================================================= #
+        # =============== DÜZELTİLMİŞ SOHBET BÖLÜMÜ =============== #
+        # ========================================================= #
+        with tab1:
+            qa_system = st.session_state.cubes[current_cube_name]
+            if f"messages_{current_cube_name}" not in st.session_state:
+                st.session_state[f"messages_{current_cube_name}"] = []
+
+            if os.path.exists("assets/logo2.png"):
+                st.markdown(
+                    f'<img src="data:image/png;base64,{get_base64_of_bin_file("assets/logo2.png")}" class="chat-logo">',
+                    unsafe_allow_html=True
+                )
+
+            # 1. Önce mevcut tüm mesaj geçmişini göster
+            # Bu döngü, her st.rerun() sonrası güncel listeyi çizecektir.
+            for message in st.session_state[f"messages_{current_cube_name}"]:
+                with st.chat_message(message["role"]):
+                    st.markdown(message["content"])
+
+            # 2. Yeni bir kullanıcı girdisi varsa işle
+            if prompt := st.chat_input(f"'{current_cube_name}' küpüne bir soru sorun..."):
+                # Kullanıcının mesajını hem session state'e ekle hem de anında ekranda göster
+                st.session_state[f"messages_{current_cube_name}"].append({"role": "user", "content": prompt})
+                with st.chat_message("user"):
+                    st.markdown(prompt)
+
+                # Asistanın cevabını bekle ve göster
+                with st.spinner("Cevap aranıyor..."):
+                    response = qa_system.answer_question(prompt)
+
+                # Asistanın cevabını session state'e ekle
+                st.session_state[f"messages_{current_cube_name}"].append({"role": "assistant", "content": response})
+
+                # Sayfayı yeniden çalıştırarak sohbeti temiz bir şekilde güncelle.
+                # Bu, bir sonraki çalıştırmada yukarıdaki döngünün yeni cevabı da içermesini sağlar.
+                st.rerun()
+        # ========================================================= #
+        # ================== DÜZELTME SONU ================== #
+        # ========================================================= #
+
+    else:
+        st.info("👈 Lütfen soldaki panelden bir küp oluşturun veya seçin.")
+        if "model_loading_status" in st.session_state:
+            st.info(f"Model durumu: {st.session_state.model_loading_status}")
+
+
+def get_base64_of_bin_file(bin_file):
+    with open(bin_file, 'rb') as f:
+        data = f.read()
+    return base64.b64encode(data).decode()
+
+
+if __name__ == "__main__":
+    main()
